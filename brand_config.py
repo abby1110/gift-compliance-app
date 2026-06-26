@@ -1,0 +1,28 @@
+BRAND_CONFIGS = {
+    "LitoMon": {
+        "inventory_sheet": "庫存",
+        "realsku_col": "Real Sku",
+        "sku_col": "Sku",
+        "tw_col": "怪獸台灣可用庫存",
+        "hk_col": "怪獸香港可用庫存",
+        "exclude_realskus": [
+            "AF375","AF376","AF377","AF378","AF381","AF384","AF385","AF387","AF388",
+            "RT412","RT413","RT414","RT415","RT424","RT425","RT428","RT429",
+            "AF350","AF351","AF352","AF357","AF358","AF359","AF371","AF372","AF373","AF374",
+            "AF390","AF391","AF393","AF394","AF396","AF397",
+            "AF361","AF362","RT418","RT419","RT420","RT421",
+            "AB0812","AF363","AF364",
+            "AF339","AF340","AF341","AF342","AF343","AF344","AF345",
+        ],
+        "gift_sheet": 0,
+        "col_sku": "商品選項貨號",
+        "col_type": "類型",
+        "col_price_ntd": "台幣價格",
+        "col_price_hkd": "港幣價格",
+        "col_status": "狀態",
+        "col_designated": "是否指定",
+        "tier_sheet": 0,
+        "tier_col_tw": "台灣門檻",
+        "tier_col_hk": "港澳門檻",
+    },
+}
