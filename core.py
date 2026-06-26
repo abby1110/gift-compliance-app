@@ -1,74 +1,305 @@
-# 常態滿額禮合規分析工具
+"""
+常態滿額禮合規分析 — 核心運算邏輯
+可跨品牌通用，透過 config 傳入品牌設定
+"""
+from __future__ import annotations
+from typing import Optional, List, Dict
+import pandas as pd
 
-跨品牌通用的滿額禮贈品折扣深度合規分析 Streamlit App。
 
-## 檔案結構
+# ── 折扣規範換算 ─────────────────────────────────────────
+# 從規範表讀出折扣比（如 0.97），換算為贈品深度上限（1-0.97=3%）
+def get_depth_rate(rules_df: pd.DataFrame, scale: str, threshold: float) -> "Optional[float]":
+    """
+    rules_df: 規範表 DataFrame，index=門檻金額，columns=檔期名稱（如「常態」）
+    取「≤ threshold 的最大門檻列」對應的折扣比，換算為深度上限
+    scale: 欄位名稱，例如「常態」「［S］SBD、雙11、618」
+    """
+    # 嘗試完全符合，再嘗試包含關係
+    col = None
+    if scale in rules_df.columns:
+        col = scale
+    else:
+        matches = [c for c in rules_df.columns if scale in c or c in scale]
+        if matches:
+            col = matches[0]
 
-```
-gift_compliance_app/
-├── app.py              ← 主程式（Streamlit 介面）
-├── core.py             ← 核心運算邏輯（不需修改）
-├── brand_config.py     ← 品牌欄位對應設定（新增品牌在這裡改）
-├── requirements.txt    ← 套件需求
-└── README.md
-```
+    if col is None:
+        return None
 
-## 本機執行
+    applicable = rules_df[rules_df.index <= threshold][col].dropna()
+    if applicable.empty:
+        return None
+    discount_ratio = applicable.iloc[-1]
+    return round(1 - float(discount_ratio), 6)
 
-```bash
-# 1. 安裝套件
-pip install -r requirements.txt
 
-# 2. 啟動
-streamlit run app.py
-```
+# ── 單一贈品合規判斷 ──────────────────────────────────────
+def classify_gift(gift_value: float, tier: float, rate: float) -> dict:
+    """
+    gift_value: 贈品價值（正商品=售價，特規品=成本價）
+    tier:       門檻金額
+    rate:       該門檻規範深度上限（如 0.03）
 
-瀏覽器自動開啟 http://localhost:8501
+    回傳 dict：depth, rule, half, status, diff, diff_pct, severity_20, severity_50
+    """
+    rule = tier * rate
+    half = rule * 0.5
+    depth = gift_value / tier
 
-## 部署到 Streamlit Cloud（免費，讓所有人能用）
+    if depth > rate:
+        status = "否,太高"
+        diff = gift_value - rule
+        diff_pct = diff / rule
+        severity_20 = "需調整" if diff_pct > 0.20 else "待觀察"
+        severity_50 = "需調整" if diff_pct > 0.50 else ("待觀察" if diff_pct > 0.20 else "")
+    elif depth < rate * 0.5:
+        status = "否,太低"
+        diff = gift_value - half      # 負數
+        diff_pct = diff / half
+        severity_20 = ""
+        severity_50 = ""
+    else:
+        status = "是"
+        diff = gift_value - rule
+        diff_pct = diff / rule
+        severity_20 = ""
+        severity_50 = ""
 
-1. 把這個資料夾上傳到 GitHub（建一個 repo）
-2. 到 https://streamlit.io/cloud 登入（用 GitHub 帳號）
-3. 點「New app」→ 選你的 repo → 選 `app.py`
-4. 點「Deploy」→ 等 2 分鐘 → 得到一個網址
-5. 把網址分享給各品牌企劃
+    return {
+        "rule": round(rule, 2),
+        "half": round(half, 2),
+        "depth": round(depth, 6),
+        "rate": rate,
+        "status": status,
+        "diff": round(diff, 2),
+        "diff_pct": round(diff_pct, 4),
+        "severity_20": severity_20,
+        "severity_50": severity_50,
+    }
 
-## 新增品牌
 
-打開 `brand_config.py`，複製 LitoMon 那一組，修改品牌名稱和欄位名稱：
+# ── 建議門檻 ─────────────────────────────────────────────
+def suggest_tier(gift_value: float, tiers: list, rates: dict) -> "Optional[float]":
+    """
+    在所有門檻中找出 half <= gift_value <= rule 的合規門檻
+    若有多個，選深度最接近規範上限的（給最高價值）
+    若無合規門檻，回傳 None
+    """
+    ok = []
+    for t in tiers:
+        rate = rates[t]
+        rule = t * rate
+        half = rule * 0.5
+        if half <= gift_value <= rule:
+            ok.append((t, gift_value / t))
+    if not ok:
+        return None
+    return max(ok, key=lambda x: x[1])[0]
 
-```python
-"超凝 Chaogel": {
-    "inventory_sheet":  "庫存",
-    "realsku_col":      "Real Sku",
-    "sku_col":          "Sku",
-    "tw_col":           "超凝台灣可用庫存",   # ← 改這個
-    "hk_col":           "超凝香港可用庫存",   # ← 改這個
-    "exclude_realskus": [],                  # ← 填非品牌商品的 RealSKU
-    ...
-}
-```
 
-存檔後 Streamlit Cloud 自動更新，企劃重新整理頁面就能看到新品牌。
+# ── 讀取庫存表 ────────────────────────────────────────────
+def load_inventory(file, brand_config: dict) -> dict[str, dict]:
+    """
+    回傳 {sku: {tw: int, hk: int}}
+    brand_config 需包含：
+        inventory_sheet, sku_col, realsku_col, tw_col, hk_col, exclude_realskus
+    """
+    cfg = brand_config
+    df = pd.read_excel(file, sheet_name=cfg["inventory_sheet"])
+    exclude = set(cfg.get("exclude_realskus", []))
 
-## 需要的四份輸入資料
+    inventory = {}
+    for _, row in df.iterrows():
+        realsku = str(row.get(cfg["realsku_col"], "")).strip()
+        sku = str(row.get(cfg["sku_col"], "")).strip()
+        if realsku in exclude or not sku:
+            continue
+        inventory[sku] = {
+            "tw": int(row.get(cfg["tw_col"], 0) or 0),
+            "hk": int(row.get(cfg["hk_col"], 0) or 0),
+        }
+    return inventory
 
-| 資料 | 格式 | 更新頻率 |
-|------|------|---------|
-| 庫存表 | .xlsx，需有台灣/香港可用庫存欄 | 每次分析當天下載 |
-| 折扣深度規範表 | .xlsx，第一欄為門檻金額 | 規範異動時 |
-| 贈品資訊表 | .xlsx，欄位見下方說明 | 每月企劃更新 |
-| 門檻設定表 | .xlsx，台灣門檻/港澳門檻兩欄 | 門檻異動時 |
 
-### 贈品資訊表必要欄位
+# ── 讀取贈品資訊 ──────────────────────────────────────────
+def load_gifts(file, brand_config: dict) -> pd.DataFrame:
+    """
+    贈品資訊表必要欄位：
+        貨號, 類型(正商品/特規品), 台幣價格, 港幣價格, 狀態, 是否指定
+    brand_config 指定各欄對應名稱
+    """
+    cfg = brand_config
+    df = pd.read_excel(file, sheet_name=cfg.get("gift_sheet", 0))
+    df = df.rename(columns={
+        cfg["col_sku"]:         "sku",
+        cfg["col_type"]:        "type",
+        cfg["col_price_ntd"]:   "price_ntd",
+        cfg["col_price_hkd"]:   "price_hkd",
+        cfg["col_status"]:      "status",
+        cfg["col_designated"]:  "designated",
+    })
+    df = df[df["sku"].notna()].copy()
+    df["price_ntd"] = pd.to_numeric(df["price_ntd"], errors="coerce")
+    df["price_hkd"] = pd.to_numeric(df["price_hkd"], errors="coerce")
+    df["designated"] = df["designated"].fillna(False).astype(bool)
+    return df
 
-| 欄位名稱 | 說明 |
-|---------|------|
-| 商品選項貨號 | 和庫存表對應的 key |
-| 類型 | `正商品` 或 `特規品` |
-| 台幣價格 | 正商品=折扣售價；特規品=成本NTD |
-| 港幣價格 | 正商品=HKD售價；特規品=成本HKD |
-| 狀態 | `啟用中` / `贈完` / `下架` |
-| 是否指定 | `TRUE`/`FALSE`（第一檻指定品免規範檢查）|
-| 台灣門檻 | (選填) 目前掛的台灣門檻金額 |
-| 港澳門檻 | (選填) 目前掛的港澳門檻金額 |
+
+# ── 讀取門檻設定 ──────────────────────────────────────────
+def load_tiers(file, brand_config: dict) -> dict[str, list]:
+    """
+    門檻設定表：欄位為市場代碼（tw/hk），值為門檻金額清單
+    回傳 {"tw": [800,1200,...], "hk": [400,800,...]}
+    """
+    cfg = brand_config
+    df = pd.read_excel(file, sheet_name=cfg.get("tier_sheet", 0))
+    result = {}
+    for market in ["tw", "hk"]:
+        col = cfg.get(f"tier_col_{market}", market)
+        if col in df.columns:
+            result[market] = sorted(
+                df[col].dropna().astype(float).tolist()
+            )
+    return result
+
+
+# ── 讀取折扣規範表 ────────────────────────────────────────
+def load_rules(file, sheet: str = "蝦皮") -> pd.DataFrame:
+    """
+    電商活動深度規範表
+    結構：row2=header（第一欄空、第二欄為門檻金額、其餘欄為檔期名稱）
+          row3起為資料
+    回傳 DataFrame，index=門檻金額，columns=檔期名稱（如「常態」「S」）
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+
+    # 嘗試讀取指定工作表，找不到就用第一張
+    if sheet in wb.sheetnames:
+        ws = wb[sheet]
+    else:
+        ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+
+    # 找 header 列：第一個「門檻金額」或數字緊接在其後的列
+    header_idx = None
+    for i, row in enumerate(rows):
+        non_none = [v for v in row if v is not None]
+        if len(non_none) >= 3 and isinstance(non_none[1], (int, float)):
+            # 這行已是資料，header 在上一行
+            header_idx = i - 1
+            break
+        if len(non_none) >= 2 and not isinstance(non_none[1], (int, float)):
+            header_idx = i
+
+    if header_idx is None:
+        header_idx = 1  # fallback
+
+    header_row = rows[header_idx]
+    col_names = []
+    for i, v in enumerate(header_row):
+        if i <= 1:
+            continue
+        col_names.append(str(v).strip() if v is not None else f"col{i}")
+
+    data = []
+    for row in rows[header_idx + 1:]:
+        if not any(v is not None for v in row):
+            continue
+        threshold = row[1] if len(row) > 1 else None
+        if not isinstance(threshold, (int, float)):
+            continue
+        record = {"threshold": float(threshold)}
+        for j, name in enumerate(col_names, 2):
+            record[name] = row[j] if j < len(row) else None
+        data.append(record)
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data).set_index("threshold").sort_index()
+    return df
+
+
+# ── 主分析函式 ────────────────────────────────────────────
+def run_analysis(
+    gifts_df: pd.DataFrame,
+    inventory: dict,
+    tiers: dict,
+    rules_df: pd.DataFrame,
+    platform: str,
+    scale: str,
+    market: str,           # "tw" or "hk"
+    currency: str,         # "ntd" or "hkd"
+    price_col: str = None, # "price_ntd" or "price_hkd"
+) -> pd.DataFrame:
+    """
+    回傳完整分析結果 DataFrame，每列一個贈品
+    """
+    price_col = price_col or f"price_{currency}"
+    market_tiers = tiers.get(market, [])
+
+    # 為每個門檻建立 rate 對照
+    tier_rates = {}
+    for t in market_tiers:
+        r = get_depth_rate(rules_df, scale, t)
+        if r is not None:
+            tier_rates[t] = r
+
+    rows = []
+    for _, gift in gifts_df.iterrows():
+        sku = gift["sku"]
+        gtype = str(gift.get("type", "")).strip()
+        value = gift[price_col]
+        status = str(gift.get("status", "")).strip()
+        designated = bool(gift.get("designated", False))
+
+        stk = inventory.get(sku, {})
+        stock = stk.get(market, 0)
+
+        # 找對應門檻（從贈品資訊表取，或從建議門檻推算）
+        # 這裡假設贈品資訊表有「台灣門檻」/「港澳門檻」欄，若無則自動建議
+        tier_col = f"tier_{market}"
+        tier = gift.get(tier_col, None)
+        if pd.isna(tier) or tier is None:
+            tier = suggest_tier(value, market_tiers, tier_rates) if value else None
+
+        row = {
+            "贈品貨號": sku,
+            "類型": gtype,
+            "狀態": status,
+            "庫存": stock,
+            "門檻": tier,
+            "贈品價值": value,
+            "是否指定": designated,
+        }
+
+        if tier and tier in tier_rates and pd.notna(value):
+            rate = tier_rates[tier]
+            result = classify_gift(value, tier, rate)
+            row.update({
+                "規範深度": result["rate"],
+                "規範折扣金額": result["rule"],
+                "規範50%": result["half"],
+                "贈品深度": result["depth"],
+                "適用性": "★指定" if designated else result["status"],
+                ">20%": "" if designated else result["severity_20"],
+                ">50%": "" if designated else result["severity_50"],
+                "差額": result["diff"],
+            })
+            if value is not None and not designated:
+                row["建議門檻"] = suggest_tier(value, market_tiers, tier_rates)
+            else:
+                row["建議門檻"] = tier
+        else:
+            row.update({
+                "規範深度": None, "規範折扣金額": None, "規範50%": None,
+                "贈品深度": None, "適用性": "待補充", ">20%": "", ">50%": "",
+                "差額": None, "建議門檻": None,
+            })
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
